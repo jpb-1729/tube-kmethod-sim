@@ -1,10 +1,17 @@
 # tube-kmethod-sim
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A C++ simulation of a two-stage vacuum tube preamplifier circuit using the
 **K-method**, a discrete-time state-space technique for simulating nonlinear
 analog circuits sample-by-sample. Tube behavior is modeled with the
 Koren tube equations, and the resulting nonlinear system is solved at each
 sample with a damped Newton-Raphson iteration.
+
+A 440 Hz sine driven into clipping, showing the odd/even harmonic content
+introduced by the tube stages:
+
+![Example input/output waveforms and output spectrum](assets/example_output.png)
 
 ## How it works
 
@@ -47,8 +54,8 @@ pip install -r requirements.txt
 python3 plot_results.py
 ```
 
-Reads `results.csv` and plots the input waveform, output waveform, and the
-output's power spectral density.
+Reads `results.csv`, plots the input waveform, output waveform, and the
+output's power spectral density, and saves the figure to `results.png`.
 
 ## Configuration
 
@@ -57,3 +64,7 @@ Amplifier parameters live in `TubeAmpConfig` in `main.cpp`: circuit values
 sample rate, and Newton solver tolerance/iteration limits. Tube presets
 (`12AX7`, `12AU7`, `12AT7`) are defined in `TUBE_PRESETS` and can be assigned
 to `tube1_params` / `tube2_params`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

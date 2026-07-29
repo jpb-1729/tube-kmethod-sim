@@ -37,6 +37,7 @@ def main():
     axes[2].grid(True, alpha=0.3)
     
     plt.tight_layout()
+    plt.savefig("results.png", dpi=150)
     plt.show()
 
 if __name__ == "__main__":

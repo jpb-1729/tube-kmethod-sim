@@ -8,10 +8,14 @@ analog circuits sample-by-sample. Tube behavior is modeled with the
 Koren tube equations, and the resulting nonlinear system is solved at each
 sample with a damped Newton-Raphson iteration.
 
-A 440 Hz sine driven into clipping, showing the odd/even harmonic content
-introduced by the tube stages:
+A 440 Hz sine driven into clipping: the zoomed input/output waveforms, the
+input–output transfer curve (the clearest view of the tube stages' asymmetric
+compression), and the output spectrum with harmonics annotated.
 
-![Example input/output waveforms and output spectrum](assets/example_output.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/example_output_dark.png">
+  <img src="assets/example_output_light.png" alt="Input and output waveforms, input-output transfer curve, and output spectrum with harmonic markers and estimated THD">
+</picture>
 
 ## How it works
 
@@ -54,8 +58,11 @@ pip install -r requirements.txt
 python3 plot_results.py
 ```
 
-Reads `results.csv`, plots the input waveform, output waveform, and the
-output's power spectral density, and saves the figure to `results.png`.
+Reads `results.csv` and renders a four-panel figure — input/output waveforms
+zoomed to a couple of cycles, the input–output transfer curve, and the output
+spectrum with harmonics labeled and an estimated THD — saved to `results.png`.
+Pass `--theme dark`, `--csv`, or `--out` to customize; run with `--help` for
+all options.
 
 ## Configuration
 

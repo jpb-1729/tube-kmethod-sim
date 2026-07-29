@@ -165,8 +165,8 @@ public:
         // Initialize
         prepare_input(x_in, u);
         x_state.setZero();
-        i_tube.setZero();
         initialize_voltage_guess(v_nodes);
+        i_tube.col(0) = compute_tube_currents(v_nodes.col(0));
 
         // Main processing loop
         process_samples(u, x_state, i_tube, v_nodes, N);

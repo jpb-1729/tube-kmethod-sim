@@ -1,5 +1,6 @@
 # tube-kmethod-sim
 
+[![CI](https://github.com/jpb-1729/tube-kmethod-sim/actions/workflows/ci.yml/badge.svg)](https://github.com/jpb-1729/tube-kmethod-sim/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A C++ simulation of a two-stage vacuum tube preamplifier circuit using the

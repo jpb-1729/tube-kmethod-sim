@@ -32,7 +32,6 @@ namespace Constants {
     constexpr double DAMPING_GROWTH_FACTOR = 1.1;
     constexpr double TUBE_IP_EXPONENT = 1.4;
     constexpr double TUBE_IA_SCALE_FACTOR = 2.0;
-    constexpr double RMS_EPSILON = 1e-9;
     constexpr size_t MAX_CONVERGENCE_WARNINGS = 10;
 }
 
@@ -345,7 +344,7 @@ private:
     const TubeModel tube2_;
     const double dt_;
     const double a_;
-    mutable size_t convergence_warning_count_;
+    size_t convergence_warning_count_;
     
     // State-space matrices
     Mat1d A_, a_eye_, H_;
@@ -371,26 +370,6 @@ std::vector<double> generate_test_signal(double freq, double amp, double dur, do
     return signal;
 }
 
-std::vector<double> normalize_audio(const std::vector<double>& x, double peak_level = 0.5) {
-    if (x.empty()) return {};
-    
-    const double mean = std::accumulate(x.begin(), x.end(), 0.0) / x.size();
-    double peak = 0.0;
-    
-    for (const double val : x) {
-        peak = std::max(peak, std::abs(val - mean));
-    }
-    
-    std::vector<double> y = x;
-    if (peak > Constants::RMS_EPSILON) {
-        const double scale = peak_level / peak;
-        for (auto& val : y) {
-            val = (val - mean) * scale;
-        }
-    }
-    return y;
-}
-
 double calculate_rms(const std::vector<double>& x) {
     if (x.empty()) return 0.0;
     const double sum_sq = std::inner_product(x.begin(), x.end(), x.begin(), 0.0);
@@ -401,6 +380,10 @@ void save_results_to_csv(const std::vector<double>& x_in,
                         const std::vector<double>& y_out,
                         double sample_rate,
                         const std::string& filename = "results.csv") {
+    if (x_in.size() != y_out.size()) {
+        throw std::invalid_argument("save_results_to_csv: x_in and y_out must be the same size");
+    }
+
     std::ofstream file(filename);
     if (!file.is_open()) {
         throw std::runtime_error("Failed to open output file: " + filename);

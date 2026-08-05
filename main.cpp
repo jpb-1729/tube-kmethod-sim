@@ -20,6 +20,8 @@
 #include <iomanip>
 #include <map>
 #include <stdexcept>
+#include <utility>
+#include <chrono>
 #include <Eigen/Dense>
 
 // Constants
@@ -34,12 +36,17 @@ namespace Constants {
     // far more generous iteration budget than the per-sample solve.
     constexpr int DC_SOLVE_MAX_ITERATIONS = 200;
     constexpr double EXP_CLAMP_LIMIT = 50.0;
-    constexpr double JACOBIAN_STEP_SIZE = 1e-7;
     constexpr double DAMPING_REDUCTION_FACTOR = 0.5;
     constexpr double DAMPING_GROWTH_FACTOR = 1.1;
     // Koren's (1 + sign(E1)) term for E1 > 0.
     constexpr double TUBE_IA_SCALE_FACTOR = 2.0;
     constexpr size_t MAX_CONVERGENCE_WARNINGS = 10;
+    // Anti-aliasing/interpolation filter for oversampled runs: ~90 dB Kaiser
+    // design with the transition band from 0.9x to 1.0x the base-rate
+    // Nyquist, which sets the tap count per unit of oversampling factor.
+    constexpr double OS_FILTER_KAISER_BETA = 8.96;
+    constexpr size_t OS_FILTER_TAPS_PER_FACTOR = 115;
+    constexpr double OS_FILTER_CUTOFF_BASE = 0.475;  // cycles/sample at base rate
 }
 
 // Type aliases
@@ -109,9 +116,130 @@ public:
                             std::pow(ip, p_.ex) / p_.kg);
     }
 
+    // d(grid_current)/d(vgk). The softplus knee differentiates to a logistic
+    // sigmoid; epsilon > 1 keeps the power-term derivative finite at s -> 0.
+    // Where the exp clamp saturates, the implemented softplus is constant, so
+    // its exact derivative is zero (far outside the operating region).
+    double grid_current_dvgk(double vgk) const {
+        const double raw = p_.cg * vgk;
+        if (std::abs(raw) >= Constants::EXP_CLAMP_LIMIT) return 0.0;
+        const double s = std::log1p(std::exp(raw)) / p_.cg;
+        const double sigmoid = 1.0 / (1.0 + std::exp(-raw));
+        return p_.gg * p_.epsilon * std::pow(s, p_.epsilon - 1.0) * sigmoid;
+    }
+
+    // {d(anode_current)/d(vak), d(anode_current)/d(vgk)} by the chain rule
+    // through ip = (vak/kp) * softplus(kp * veff).
+    std::pair<double, double> anode_current_derivatives(double vak, double vgk) const {
+        if (vak <= 0) return {0.0, 0.0};
+
+        const double root = std::sqrt(p_.kvb + vak * vak);
+        const double veff = 1.0 / p_.mu + (vgk + p_.vct) / root;
+        const double raw = p_.kp * veff;
+        const double t = std::clamp(raw,
+                                    -Constants::EXP_CLAMP_LIMIT,
+                                    Constants::EXP_CLAMP_LIMIT);
+        const double sp = std::log1p(std::exp(t));
+        // Where the clamp saturates, sp is constant wrt the voltages and only
+        // the (vak/kp) prefactor of ip still varies.
+        const double sigmoid = (std::abs(raw) < Constants::EXP_CLAMP_LIMIT)
+            ? 1.0 / (1.0 + std::exp(-t)) : 0.0;
+        const double ip = (vak / p_.kp) * sp;
+        if (ip <= 0) return {0.0, 0.0};
+
+        const double dia_dip = Constants::TUBE_IA_SCALE_FACTOR * p_.ex *
+                               std::pow(ip, p_.ex - 1.0) / p_.kg;
+        const double dveff_dvak = -(vgk + p_.vct) * vak / (root * root * root);
+        const double dip_dvak = sp / p_.kp + vak * sigmoid * dveff_dvak;
+        const double dip_dvgk = vak * sigmoid / root;
+        return {dia_dip * dip_dvak, dia_dip * dip_dvgk};
+    }
+
 private:
     const TubeModelParams p_;
 };
+
+// =============================================================================
+//                      RESAMPLING (oversampling support)
+// =============================================================================
+//
+// The nonlinear loop runs at oversample_factor times the output rate so that
+// clipping harmonics fall below the internal Nyquist instead of aliasing into
+// the audio band. One linear-phase Kaiser-windowed-sinc lowpass serves as
+// both the interpolation and the anti-aliasing (decimation) filter; its group
+// delay is an integer number of internal samples and is compensated exactly,
+// keeping the decimated output sample-aligned with the base-rate input.
+
+namespace resample {
+
+double bessel_i0(double x) {
+    double sum = 1.0, term = 1.0;
+    for (int k = 1; k < 64; ++k) {
+        term *= (x * x) / (4.0 * k * k);
+        sum += term;
+        if (term < sum * 1e-16) break;
+    }
+    return sum;
+}
+
+// Odd-length, unity-DC-gain lowpass. cutoff is in cycles per sample at the
+// rate the filter runs at; 0.5 is that rate's Nyquist.
+std::vector<double> kaiser_lowpass(size_t taps, double cutoff, double beta) {
+    const int mid = static_cast<int>(taps - 1) / 2;
+    std::vector<double> h(taps);
+    double sum = 0.0;
+    const double norm = bessel_i0(beta);
+    for (size_t n = 0; n < taps; ++n) {
+        const int m = static_cast<int>(n) - mid;
+        const double sinc = (m == 0)
+            ? 2.0 * cutoff
+            : std::sin(2.0 * M_PI * cutoff * m) / (M_PI * m);
+        const double r = static_cast<double>(m) / mid;
+        h[n] = sinc * bessel_i0(beta * std::sqrt(1.0 - r * r)) / norm;
+        sum += h[n];
+    }
+    for (double& v : h) v /= sum;
+    return h;
+}
+
+// Zero-stuff by factor and lowpass, exploiting the stuffed zeros (each input
+// sample scatters through the kernel once). Gain factor restores the level.
+std::vector<double> upsample_fir(const std::vector<double>& in, int factor,
+                                 const std::vector<double>& h) {
+    const int mid = static_cast<int>(h.size() - 1) / 2;
+    const long n_out = static_cast<long>(in.size()) * factor;
+    std::vector<double> out(n_out, 0.0);
+    for (size_t j = 0; j < in.size(); ++j) {
+        const double x = in[j] * factor;
+        const long base = static_cast<long>(j) * factor + mid;
+        for (size_t k = 0; k < h.size(); ++k) {
+            const long i = base - static_cast<long>(k);
+            if (i >= 0 && i < n_out) out[i] += h[k] * x;
+        }
+    }
+    return out;
+}
+
+// Lowpass below the base-rate Nyquist and keep every factor-th sample,
+// computing only the samples that survive decimation.
+std::vector<double> decimate_fir(const std::vector<double>& in, int factor,
+                                 const std::vector<double>& h) {
+    const int mid = static_cast<int>(h.size() - 1) / 2;
+    const long n_in = static_cast<long>(in.size());
+    std::vector<double> out(in.size() / factor, 0.0);
+    for (size_t i = 0; i < out.size(); ++i) {
+        const long center = static_cast<long>(i) * factor + mid;
+        double acc = 0.0;
+        for (size_t k = 0; k < h.size(); ++k) {
+            const long idx = center - static_cast<long>(k);
+            if (idx >= 0 && idx < n_in) acc += h[k] * in[idx];
+        }
+        out[i] = acc;
+    }
+    return out;
+}
+
+}  // namespace resample
 
 // =============================================================================
 //                            TUBE AMPLIFIER CONFIGURATION
@@ -130,6 +258,9 @@ struct TubeAmpConfig {
     
     // Operating parameters
     double sample_rate = 44100.0;
+    // The nonlinear solve runs at sample_rate * oversample_factor; the output
+    // is anti-alias filtered back down to sample_rate. 1 disables resampling.
+    int oversample_factor = 8;
     double gain = 2.0;
     double bias_voltage = 325.0;
     
@@ -144,6 +275,9 @@ struct TubeAmpConfig {
     void validate() const {
         if (sample_rate <= 0) {
             throw std::invalid_argument("Sample rate must be positive");
+        }
+        if (oversample_factor < 1) {
+            throw std::invalid_argument("Oversample factor must be >= 1");
         }
         if (newton_tolerance <= 0) {
             throw std::invalid_argument("Newton tolerance must be positive");
@@ -162,31 +296,45 @@ struct TubeAmpConfig {
 class TubeAmplifier {
 public:
     explicit TubeAmplifier(const TubeAmpConfig& config)
-        : cfg_(config), 
-          tube1_(cfg_.tube1_params), 
+        : cfg_(config),
+          tube1_(cfg_.tube1_params),
           tube2_(cfg_.tube2_params),
-          dt_(1.0 / cfg_.sample_rate), 
+          dt_(1.0 / (cfg_.sample_rate * std::max(1, cfg_.oversample_factor))),
           a_(2.0 / dt_),
-          convergence_warning_count_(0) {
-        
+          convergence_warning_count_(0),
+          output_offset_(0) {
+
         cfg_.validate();
+        if (cfg_.oversample_factor > 1) {
+            size_t taps = Constants::OS_FILTER_TAPS_PER_FACTOR *
+                          static_cast<size_t>(cfg_.oversample_factor) + 1;
+            if (taps % 2 == 0) ++taps;
+            kernel_ = resample::kaiser_lowpass(
+                taps,
+                Constants::OS_FILTER_CUTOFF_BASE / cfg_.oversample_factor,
+                Constants::OS_FILTER_KAISER_BETA);
+        }
         initialize_state_space();
         solve_dc_operating_point();
     }
 
     std::vector<double> process(const std::vector<double>& x_in) {
-        const size_t N = x_in.size();
-        if (N == 0) return {};
+        if (x_in.empty()) return {};
+        const int factor = cfg_.oversample_factor;
+        const std::vector<double> x_int = (factor > 1)
+            ? resample::upsample_fir(x_in, factor, kernel_)
+            : x_in;
+        const size_t N = x_int.size();
 
         // Pre-allocate all working memory
         Eigen::Matrix<double, 2, Eigen::Dynamic> u(2, N);
         Eigen::Matrix<double, 1, Eigen::Dynamic> x_state(1, N);
         Eigen::Matrix<double, 4, Eigen::Dynamic> i_tube(4, N);
         Eigen::Matrix<double, 4, Eigen::Dynamic> v_nodes(4, N);
-        
+
         // Start from the quiescent operating point, so sample 0 is already a
         // self-consistent solution rather than an unsolved guess.
-        prepare_input(x_in, u);
+        prepare_input(x_int, u);
         x_state.setZero();
         v_nodes.col(0) = v_dc_;
         x_state.col(0) = x_dc_;
@@ -198,6 +346,10 @@ public:
         // Extract and prepare output
         return extract_output(i_tube, N);
     }
+
+    // Index into the ORIGINAL input where the returned output starts (the
+    // transient trim), so callers can align input and output sample-exactly.
+    size_t output_offset() const { return output_offset_; }
 
 private:
     void initialize_state_space() {
@@ -318,18 +470,18 @@ private:
         );
     }
     
+    // Analytic Jacobian of the tube currents. Each tube couples only to its
+    // own grid and anode voltages, so just 6 of the 16 entries are nonzero.
     Mat4d compute_jacobian(const Vec4d& v) const {
         Mat4d J = Mat4d::Zero();
-        const double h = Constants::JACOBIAN_STEP_SIZE;
-        
-        // Central difference approximation
-        for (int i = 0; i < 4; ++i) {
-            Vec4d v_plus = v;
-            Vec4d v_minus = v;
-            v_plus(i) += h;
-            v_minus(i) -= h;
-            J.col(i) = (compute_tube_currents(v_plus) - compute_tube_currents(v_minus)) / (2.0 * h);
-        }
+        J(0, 0) = tube1_.grid_current_dvgk(v(0));
+        const auto [dia1_dvak, dia1_dvgk] = tube1_.anode_current_derivatives(v(1), v(0));
+        J(1, 0) = dia1_dvgk;
+        J(1, 1) = dia1_dvak;
+        J(2, 2) = tube2_.grid_current_dvgk(v(2));
+        const auto [dia2_dvak, dia2_dvgk] = tube2_.anode_current_derivatives(v(3), v(2));
+        J(3, 2) = dia2_dvgk;
+        J(3, 3) = dia2_dvak;
         return J;
     }
 
@@ -382,18 +534,38 @@ private:
     }
 
     std::vector<double> extract_output(const Eigen::Matrix<double, 4, Eigen::Dynamic>& i_tube,
-                                      size_t N) const {
+                                       size_t n_internal) {
         // Output is the voltage the second stage's total cathode current
         // develops across rk2. Both currents must be summed before scaling by
         // the resistance: scaling only one of them adds a voltage to a current.
-        std::vector<double> y(N);
-        for (size_t i = 0; i < N; ++i) {
-            y[i] = -(i_tube(3, i) + i_tube(2, i)) * cfg_.rk2; // Inverted
+        std::vector<double> y_int(n_internal);
+        for (size_t i = 0; i < n_internal; ++i) {
+            y_int[i] = -(i_tube(3, i) + i_tube(2, i)) * cfg_.rk2; // Inverted
         }
-        
-        // Remove transient
-        const size_t transient_samples = calculate_transient_samples(N);
-        return std::vector<double>(y.begin() + transient_samples, y.end());
+
+        std::vector<double> y = (cfg_.oversample_factor > 1)
+            ? resample::decimate_fir(y_int, cfg_.oversample_factor, kernel_)
+            : std::move(y_int);
+
+        // Trim the bias-shift transient from the head and the filter-edge
+        // samples (whose convolution window hangs past the data) from the
+        // tail; the head edge is buried inside the much longer transient.
+        const size_t head = calculate_transient_samples(y.size());
+        const size_t tail = filter_edge_samples();
+        output_offset_ = head;
+        if (head + tail >= y.size()) {
+            return {};
+        }
+        return std::vector<double>(y.begin() + head, y.end() - tail);
+    }
+
+    // Decimated samples at each end whose filter window extends past the
+    // available data (both the interpolation and the decimation filter
+    // contribute half a kernel of group delay each).
+    size_t filter_edge_samples() const {
+        if (cfg_.oversample_factor <= 1) return 0;
+        const size_t half = (kernel_.size() - 1) / 2;
+        return 2 * half / static_cast<size_t>(cfg_.oversample_factor) + 1;
     }
 
     // Slowest time constant of the linear subsystem (here the cathode bypass
@@ -430,6 +602,8 @@ private:
     const double dt_;
     const double a_;
     size_t convergence_warning_count_;
+    size_t output_offset_;
+    std::vector<double> kernel_;  // shared interpolation/anti-alias filter
     
     // State-space matrices
     Mat1d A_, a_eye_, H_;
@@ -519,12 +693,24 @@ int main() {
         
         // Process
         TubeAmplifier amp(cfg);
-        std::cout << "Processing " << x_in.size() << " samples...\n";
+        std::cout << "Processing " << x_in.size() << " samples ("
+                  << cfg.oversample_factor << "x oversampled)...\n";
+        const auto t_start = std::chrono::steady_clock::now();
         const auto y_raw = amp.process(x_in);
-        
-        // Prepare for output
-        const size_t transient_samples = x_in.size() - y_raw.size();
-        std::vector<double> x_in_trimmed(x_in.begin() + transient_samples, x_in.end());
+        const double elapsed_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_start).count();
+        const double audio_s = x_in.size() / cfg.sample_rate;
+        std::cout << "Processed in " << elapsed_s * 1000.0 << " ms ("
+                  << audio_s / elapsed_s << "x real-time)\n";
+
+        if (y_raw.empty()) {
+            throw std::runtime_error("Input too short: nothing survived the transient trim");
+        }
+
+        // Align the input with the trimmed output
+        const size_t offset = amp.output_offset();
+        std::vector<double> x_in_trimmed(x_in.begin() + offset,
+                                         x_in.begin() + offset + y_raw.size());
         
         // Save results
         std::cout << "Saving results to results.csv...\n";

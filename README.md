@@ -27,8 +27,13 @@ spectrum with harmonics annotated plus an even/odd harmonic breakdown.
 - The two tubes contribute nonlinear grid and anode currents (Koren model)
   that couple back into the circuit's node voltages.
 - At every sample, a 4x4 nonlinear system for the tube node voltages is
-  solved with Newton's method (finite-difference Jacobian, adaptive damping,
+  solved with Newton's method (analytic Jacobian, adaptive damping,
   LU decomposition with a pseudo-inverse fallback for ill-conditioned steps).
+- The nonlinear loop runs oversampled (8x by default) so that clipping
+  harmonics fall below the internal Nyquist instead of aliasing into the
+  audio band. A linear-phase Kaiser windowed-sinc filter (~90 dB) handles
+  interpolation and decimation, with its group delay compensated exactly so
+  the output stays sample-aligned with the input.
 - Before processing starts, the same solver is run against the steady-state
   (`dx/dt = 0`) form of the system to find the quiescent DC operating point,
   and the simulation is initialized there. This removes the cold-start
@@ -95,7 +100,8 @@ point and within 0.01 dB on all harmonics through H10.
 
 Amplifier parameters live in `TubeAmpConfig` in `main.cpp`: circuit values
 (plate/grid/cathode resistors, cathode bypass cap), gain, bias voltage,
-sample rate, and Newton solver tolerance/iteration limits. Tube presets
+sample rate, oversampling factor (`oversample_factor`, set to 1 to disable),
+and Newton solver tolerance/iteration limits. Tube presets
 (`12AX7`, `12AU7`, `12AT7`) use Norman Koren's published parameter fits
 (mu, Ex, Kg1, Kp, Kvb) and are defined in `TUBE_PRESETS`; they can be
 assigned to `tube1_params` / `tube2_params`.

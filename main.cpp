@@ -244,6 +244,15 @@ private:
         v_dc_ = v_dc;
         i_dc_ = compute_tube_currents(v_dc_);
         x_dc_ = -A_inv_ * (B_ * u_dc + C_ * i_dc_);
+
+        // Machine-readable operating point, consumed by validate_spice.py to
+        // cross-check this solver against ngspice on the same circuit.
+        std::cout << std::setprecision(12)
+                  << "DC-OP vgk1=" << v_dc_(0) << " vak1=" << v_dc_(1)
+                  << " vgk2=" << v_dc_(2) << " vak2=" << v_dc_(3)
+                  << " ig1=" << i_dc_(0) << " ia1=" << i_dc_(1)
+                  << " ig2=" << i_dc_(2) << " ia2=" << i_dc_(3)
+                  << std::setprecision(6) << "\n";
     }
 
     void prepare_input(const std::vector<double>& x_in, 

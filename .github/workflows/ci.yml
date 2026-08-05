@@ -18,15 +18,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Eigen3 (Linux)
+      - name: Install Eigen3 and ngspice (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libeigen3-dev
+          sudo apt-get install -y libeigen3-dev ngspice
 
-      - name: Install Eigen3 (macOS)
+      - name: Install Eigen3 and ngspice (macOS)
         if: runner.os == 'macOS'
-        run: brew install eigen
+        run: brew install eigen ngspice
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -36,3 +36,13 @@ jobs:
 
       - name: Run simulation (smoke test)
         run: ./build/SimpleTubeSim
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate against ngspice
+        run: |
+          pip install numpy pandas
+          python validate_spice.py

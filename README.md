@@ -75,6 +75,22 @@ an estimated THD, and an even/odd harmonic-level breakdown — saved to
 even/odd split) is also printed to the console. Pass `--theme dark`, `--csv`,
 `--out`, or `--fmax` to customize; run with `--help` for all options.
 
+## Validation against SPICE
+
+```bash
+brew install ngspice   # or: apt-get install ngspice
+python3 validate_spice.py
+```
+
+`validate_spice.py` cross-checks the simulator against **ngspice** solving
+the same circuit with identical device equations (the Koren anode and
+softplus grid-current models expressed as behavioral B-sources), so any
+disagreement isolates the numerical method rather than the device model. It
+compares the DC operating point, the steady-state transfer curve, and the
+harmonic levels/THD, and exits nonzero on any tolerance failure. The check
+runs in CI on every push; current agreement is sub-millivolt on the operating
+point and within 0.01 dB on all harmonics through H10.
+
 ## Configuration
 
 Amplifier parameters live in `TubeAmpConfig` in `main.cpp`: circuit values

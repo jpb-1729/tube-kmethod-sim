@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <utility>
 #include <chrono>
+#include <random>
 #include <Eigen/Dense>
 
 // Constants
@@ -47,13 +48,19 @@ namespace Constants {
     constexpr double OS_FILTER_KAISER_BETA = 8.96;
     constexpr size_t OS_FILTER_TAPS_PER_FACTOR = 115;
     constexpr double OS_FILTER_CUTOFF_BASE = 0.475;  // cycles/sample at base rate
+    constexpr double BOLTZMANN = 1.380649e-23;  // J/K
+    // A triode's shot/partition noise referred to its grid is well
+    // approximated as Johnson noise of an equivalent resistance ~2.5/gm.
+    constexpr double TRIODE_NOISE_RESISTANCE_FACTOR = 2.5;
 }
 
-// Type aliases
-using Vec4d = Eigen::Vector4d;
-using Mat4d = Eigen::Matrix4d;
-using Vec1d = Eigen::Matrix<double, 1, 1>;
-using Mat1d = Eigen::Matrix<double, 1, 1>;
+// Type aliases. The nonlinear system has 6 unknowns (grid and anode voltage
+// per tube); the linear subsystem has 4 states (two cathode bypass caps and
+// two coupling caps).
+using Vec6d = Eigen::Matrix<double, 6, 1>;
+using Mat6d = Eigen::Matrix<double, 6, 6>;
+using StateVec = Eigen::Vector4d;
+using StateMat = Eigen::Matrix4d;
 
 // =============================================================================
 //                            TUBE MODEL
@@ -255,6 +262,22 @@ struct TubeAmpConfig {
     double rk1 = 0.820e3;
     double rk2 = 50e3;
     double ck = 25e-6;
+
+    // Interstage network: the follower output couples through c_couple into
+    // an r_top/r_shunt divider (standing in for the loss of a tone stack /
+    // gain pot) and then a grid stopper into stage 3. Grid current charging
+    // c_couple is what produces blocking distortion under heavy drive.
+    double c_couple = 22e-9;
+    double r_top = 680e3;
+    double r_shunt = 330e3;
+    double rg3 = 470e3;
+
+    // Stage 3 (second gain stage) and the AC-coupled output load.
+    double rk3 = 0.820e3;
+    double ck3 = 25e-6;
+    double ra3 = 100e3;
+    double c_out = 22e-9;
+    double r_load = 1e6;
     
     // Operating parameters
     double sample_rate = 44100.0;
@@ -267,11 +290,24 @@ struct TubeAmpConfig {
     // Tube models
     TubeModelParams tube1_params = TUBE_PRESETS.at("12AX7");
     TubeModelParams tube2_params = TUBE_PRESETS.at("12AX7");
+    TubeModelParams tube3_params = TUBE_PRESETS.at("12AX7");
     
+    // Input-referred noise: Johnson noise of the grid stopper plus the first
+    // tube's equivalent noise resistance (2.5/gm at the operating point),
+    // injected at the grid over the full internal bandwidth.
+    bool noise_enabled = true;
+    unsigned noise_seed = 20260805u;
+    double noise_temperature = 293.0;  // K
+
+    // Trim the signal-induced bias-shift transient from the head of the
+    // output. Correct for steady-state analysis; disable for transient
+    // stimuli (plucks, bursts) where the attack is the point.
+    bool trim_transient = true;
+
     // Solver parameters
     double newton_tolerance = 1e-4;
     int newton_max_iterations = 22;
-    
+
     void validate() const {
         if (sample_rate <= 0) {
             throw std::invalid_argument("Sample rate must be positive");
@@ -282,9 +318,15 @@ struct TubeAmpConfig {
         if (newton_tolerance <= 0) {
             throw std::invalid_argument("Newton tolerance must be positive");
         }
-        // The state matrix is -1/(ck*rk1) and is inverted for the DC solve.
-        if (ck <= 0 || rk1 <= 0) {
-            throw std::invalid_argument("Cathode capacitor and resistor must be positive");
+        // Every state's time constant appears on the (diagonal) state matrix,
+        // which is inverted for the DC solve.
+        if (ck <= 0 || rk1 <= 0 || ck3 <= 0 || rk3 <= 0 ||
+            c_couple <= 0 || c_out <= 0) {
+            throw std::invalid_argument("Capacitors and their resistors must be positive");
+        }
+        if (rk2 <= 0 || r_top < 0 || r_shunt <= 0 || rg3 < 0 ||
+            ra3 <= 0 || r_load <= 0) {
+            throw std::invalid_argument("Interstage and load resistors must be positive");
         }
     }
 };
@@ -299,10 +341,12 @@ public:
         : cfg_(config),
           tube1_(cfg_.tube1_params),
           tube2_(cfg_.tube2_params),
+          tube3_(cfg_.tube3_params),
           dt_(1.0 / (cfg_.sample_rate * std::max(1, cfg_.oversample_factor))),
           a_(2.0 / dt_),
           convergence_warning_count_(0),
-          output_offset_(0) {
+          output_offset_(0),
+          rng_(config.noise_seed) {
 
         cfg_.validate();
         if (cfg_.oversample_factor > 1) {
@@ -328,13 +372,19 @@ public:
 
         // Pre-allocate all working memory
         Eigen::Matrix<double, 2, Eigen::Dynamic> u(2, N);
-        Eigen::Matrix<double, 1, Eigen::Dynamic> x_state(1, N);
-        Eigen::Matrix<double, 4, Eigen::Dynamic> i_tube(4, N);
-        Eigen::Matrix<double, 4, Eigen::Dynamic> v_nodes(4, N);
+        Eigen::Matrix<double, 4, Eigen::Dynamic> x_state(4, N);
+        Eigen::Matrix<double, 6, Eigen::Dynamic> i_tube(6, N);
+        Eigen::Matrix<double, 6, Eigen::Dynamic> v_nodes(6, N);
 
         // Start from the quiescent operating point, so sample 0 is already a
         // self-consistent solution rather than an unsolved guess.
         prepare_input(x_int, u);
+        if (noise_sigma_ > 0.0) {
+            std::normal_distribution<double> dist(0.0, noise_sigma_);
+            for (size_t i = 0; i < N; ++i) {
+                u(0, i) += dist(rng_);
+            }
+        }
         x_state.setZero();
         v_nodes.col(0) = v_dc_;
         x_state.col(0) = x_dc_;
@@ -344,7 +394,7 @@ public:
         process_samples(u, x_state, i_tube, v_nodes, N);
 
         // Extract and prepare output
-        return extract_output(i_tube, N);
+        return extract_output(i_tube, x_state, N);
     }
 
     // Index into the ORIGINAL input where the returned output starts (the
@@ -353,17 +403,83 @@ public:
 
 private:
     void initialize_state_space() {
-        A_(0,0) = -1.0 / (cfg_.ck * cfg_.rk1);
+        // States: x1 = cathode-1 bypass cap, x2 = interstage coupling cap
+        // (vk2 side minus divider side), x3 = cathode-3 bypass cap,
+        // x4 = output coupling cap (plate-3 side minus load side).
+        // Unknowns v = (vgk1, vak1, vgk2, vak2, vgk3, vak3), currents
+        // i = (ig1, ia1, ig2, ia2, ig3, ia3), inputs u = (vin, B+).
+        //
+        // Interstage network, from KCL at the follower cathode and the
+        // divider node: sigma is the total resistance the coupling cap
+        // discharges through, rq the follower's effective AC load.
+        const double sigma = cfg_.rk2 + cfg_.r_top + cfg_.r_shunt;
+        const double rq = cfg_.rk2 * (cfg_.r_top + cfg_.r_shunt) / sigma;
+        const double mu_c = cfg_.rk2 / sigma;
+        const double lam = cfg_.r_shunt / (cfg_.r_top + cfg_.r_shunt);
+        // Divider-node voltage coefficients: per follower cathode current,
+        // per stage-3 grid current, and per volt of coupling-cap state.
+        const double r_div_i = cfg_.rk2 * cfg_.r_shunt / sigma;
+        const double r_div_g3 = cfg_.r_shunt * (cfg_.rk2 + cfg_.r_top) / sigma;
+        const double d_div_x2 = cfg_.r_shunt / sigma;
+        // Output network: plate 3 loaded by ra3 and, through c_out, r_load.
+        const double rp3 = cfg_.ra3 * cfg_.r_load / (cfg_.ra3 + cfg_.r_load);
+        const double beta = cfg_.ra3 / (cfg_.ra3 + cfg_.r_load);
+        out_gamma_ = cfg_.r_load / (cfg_.ra3 + cfg_.r_load);
+        out_rp3_ = rp3;
+
+        A_.setZero();
+        A_(0, 0) = -1.0 / (cfg_.ck * cfg_.rk1);
+        A_(1, 1) = -1.0 / (sigma * cfg_.c_couple);
+        A_(2, 2) = -1.0 / (cfg_.ck3 * cfg_.rk3);
+        A_(3, 3) = -1.0 / ((cfg_.ra3 + cfg_.r_load) * cfg_.c_out);
+
         B_.setZero();
-        C_ << 1.0 / cfg_.ck, 1.0 / cfg_.ck, 0.0, 0.0;
-        D_ << -1.0, -1.0, 0.0, 0.0;
-        E_ << 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0;
-        F_ << -cfg_.rg, 0.0, 0.0, 0.0,
-              0.0, -cfg_.ra1, -cfg_.ra1, 0.0,
-              0.0, -cfg_.ra1, -cfg_.ra1 - cfg_.rk2, -cfg_.rk2,
-              0.0, 0.0, -cfg_.rk2, -cfg_.rk2;
-        
-        a_eye_(0,0) = a_;
+        B_(3, 1) = out_gamma_ / (cfg_.r_load * cfg_.c_out);
+
+        C_.setZero();
+        C_(0, 0) = 1.0 / cfg_.ck;
+        C_(0, 1) = 1.0 / cfg_.ck;
+        C_(1, 2) = mu_c / cfg_.c_couple;
+        C_(1, 3) = mu_c / cfg_.c_couple;
+        C_(1, 4) = d_div_x2 / cfg_.c_couple;
+        C_(2, 4) = 1.0 / cfg_.ck3;
+        C_(2, 5) = 1.0 / cfg_.ck3;
+        C_(3, 5) = -beta / cfg_.c_out;
+
+        D_.setZero();
+        D_(0, 0) = -1.0;
+        D_(1, 0) = -1.0;
+        D_(2, 1) = -mu_c;
+        D_(3, 1) = -mu_c;
+        D_(4, 1) = -d_div_x2;
+        D_(4, 2) = -1.0;
+        D_(5, 2) = -1.0;
+        D_(5, 3) = beta;
+
+        E_.setZero();
+        E_(0, 0) = 1.0;
+        E_(1, 1) = 1.0;
+        E_(2, 1) = 1.0;
+        E_(3, 1) = 1.0;
+        E_(5, 1) = out_gamma_;
+
+        F_.setZero();
+        F_(0, 0) = -cfg_.rg;
+        F_(1, 1) = -cfg_.ra1;
+        F_(1, 2) = -cfg_.ra1;
+        F_(2, 1) = -cfg_.ra1;
+        F_(2, 2) = -(cfg_.ra1 + rq);
+        F_(2, 3) = -rq;
+        F_(2, 4) = rq * lam;
+        F_(3, 2) = -rq;
+        F_(3, 3) = -rq;
+        F_(3, 4) = rq * lam;
+        F_(4, 2) = r_div_i;
+        F_(4, 3) = r_div_i;
+        F_(4, 4) = -(r_div_g3 + cfg_.rg3);
+        F_(5, 5) = -rp3;
+
+        a_eye_ = a_ * StateMat::Identity();
         H_ = (a_eye_ - A_).inverse();
         
         // Pre-compute matrices for efficiency
@@ -384,7 +500,7 @@ private:
     // into it over several cathode-bypass time constants.
     void solve_dc_operating_point() {
         const Eigen::Vector2d u_dc(0.0, cfg_.bias_voltage);
-        const Vec4d p_dc = (E_ - D_ * A_inv_ * B_) * u_dc;
+        const Vec6d p_dc = (E_ - D_ * A_inv_ * B_) * u_dc;
 
         const auto [v_dc, converged] = newton_solve(K_dc_, p_dc, initial_voltage_guess(),
                                                     Constants::DC_SOLVE_MAX_ITERATIONS);
@@ -402,9 +518,24 @@ private:
         std::cout << std::setprecision(12)
                   << "DC-OP vgk1=" << v_dc_(0) << " vak1=" << v_dc_(1)
                   << " vgk2=" << v_dc_(2) << " vak2=" << v_dc_(3)
-                  << " ig1=" << i_dc_(0) << " ia1=" << i_dc_(1)
-                  << " ig2=" << i_dc_(2) << " ia2=" << i_dc_(3)
+                  << " vgk3=" << v_dc_(4) << " vak3=" << v_dc_(5)
+                  << " ia1=" << i_dc_(1) << " ia2=" << i_dc_(3)
+                  << " ia3=" << i_dc_(5)
                   << std::setprecision(6) << "\n";
+
+        // Input-referred noise level, from the physical operating point: the
+        // grid stopper's Johnson noise plus the tube's 2.5/gm equivalent,
+        // white across the internal Nyquist bandwidth.
+        if (cfg_.noise_enabled) {
+            const double gm1 = tube1_.anode_current_derivatives(v_dc_(1), v_dc_(0)).second;
+            const double r_eq = (gm1 > 0)
+                ? Constants::TRIODE_NOISE_RESISTANCE_FACTOR / gm1 : 0.0;
+            const double bandwidth =
+                0.5 * cfg_.sample_rate * std::max(1, cfg_.oversample_factor);
+            noise_sigma_ = std::sqrt(4.0 * Constants::BOLTZMANN *
+                                     cfg_.noise_temperature *
+                                     (cfg_.rg + r_eq) * bandwidth);
+        }
     }
 
     void prepare_input(const std::vector<double>& x_in, 
@@ -415,16 +546,18 @@ private:
         }
     }
 
-    Vec4d initial_voltage_guess() const {
+    Vec6d initial_voltage_guess() const {
         // Rough operating point for a small-signal triode; only used to seed
         // the one-off DC solve, which then seeds every per-sample solve.
-        return Vec4d(-1.5, 150.0, -1.5, 150.0);
+        Vec6d guess;
+        guess << -1.5, 150.0, -1.5, 150.0, -1.5, 150.0;
+        return guess;
     }
 
     void process_samples(const Eigen::Matrix<double, 2, Eigen::Dynamic>& u,
-                        Eigen::Matrix<double, 1, Eigen::Dynamic>& x_state,
-                        Eigen::Matrix<double, 4, Eigen::Dynamic>& i_tube,
-                        Eigen::Matrix<double, 4, Eigen::Dynamic>& v_nodes,
+                        Eigen::Matrix<double, 4, Eigen::Dynamic>& x_state,
+                        Eigen::Matrix<double, 6, Eigen::Dynamic>& i_tube,
+                        Eigen::Matrix<double, 6, Eigen::Dynamic>& v_nodes,
                         size_t N) {
         for (size_t n = 1; n < N; ++n) {
             process_single_sample(n, u, x_state, i_tube, v_nodes);
@@ -433,17 +566,17 @@ private:
 
     void process_single_sample(size_t n,
                               const Eigen::Matrix<double, 2, Eigen::Dynamic>& u,
-                              Eigen::Matrix<double, 1, Eigen::Dynamic>& x_state,
-                              Eigen::Matrix<double, 4, Eigen::Dynamic>& i_tube,
-                              Eigen::Matrix<double, 4, Eigen::Dynamic>& v_nodes) {
-        const Vec1d x_prev = x_state.col(n - 1);
-        const Vec4d i_prev = i_tube.col(n - 1);
+                              Eigen::Matrix<double, 4, Eigen::Dynamic>& x_state,
+                              Eigen::Matrix<double, 6, Eigen::Dynamic>& i_tube,
+                              Eigen::Matrix<double, 6, Eigen::Dynamic>& v_nodes) {
+        const StateVec x_prev = x_state.col(n - 1);
+        const Vec6d i_prev = i_tube.col(n - 1);
         const Eigen::Vector2d u_curr = u.col(n);
         const Eigen::Vector2d u_prev = u.col(n - 1);
 
         // K-method state calculation
-        const Vec1d state_part = (a_eye_ + A_) * x_prev + B_ * (u_curr + u_prev) + C_ * i_prev;
-        const Vec4d p = DH_ * state_part + E_ * u_curr;
+        const StateVec state_part = (a_eye_ + A_) * x_prev + B_ * (u_curr + u_prev) + C_ * i_prev;
+        const Vec6d p = DH_ * state_part + E_ * u_curr;
         
         // Solve nonlinear system with previous solution as initial guess
         auto [v_solved, converged] = newton_solve(K_, p, v_nodes.col(n - 1),
@@ -456,24 +589,26 @@ private:
 
         // Update currents and state
         i_tube.col(n) = compute_tube_currents(v_nodes.col(n));
-        const Vec4d i_curr = i_tube.col(n);
+        const Vec6d i_curr = i_tube.col(n);
         x_state.col(n) = H_ * ((a_eye_ + A_) * x_prev + B_ * (u_curr + u_prev) + 
                                C_ * (i_curr + i_prev));
     }
 
-    Vec4d compute_tube_currents(const Vec4d& v) const {
-        return Vec4d(
-            tube1_.grid_current(v(0)),
-            tube1_.anode_current(v(1), v(0)),
-            tube2_.grid_current(v(2)),
-            tube2_.anode_current(v(3), v(2))
-        );
+    Vec6d compute_tube_currents(const Vec6d& v) const {
+        Vec6d i;
+        i << tube1_.grid_current(v(0)),
+             tube1_.anode_current(v(1), v(0)),
+             tube2_.grid_current(v(2)),
+             tube2_.anode_current(v(3), v(2)),
+             tube3_.grid_current(v(4)),
+             tube3_.anode_current(v(5), v(4));
+        return i;
     }
     
     // Analytic Jacobian of the tube currents. Each tube couples only to its
-    // own grid and anode voltages, so just 6 of the 16 entries are nonzero.
-    Mat4d compute_jacobian(const Vec4d& v) const {
-        Mat4d J = Mat4d::Zero();
+    // own grid and anode voltages, so just 9 of the 36 entries are nonzero.
+    Mat6d compute_jacobian(const Vec6d& v) const {
+        Mat6d J = Mat6d::Zero();
         J(0, 0) = tube1_.grid_current_dvgk(v(0));
         const auto [dia1_dvak, dia1_dvgk] = tube1_.anode_current_derivatives(v(1), v(0));
         J(1, 0) = dia1_dvgk;
@@ -482,31 +617,35 @@ private:
         const auto [dia2_dvak, dia2_dvgk] = tube2_.anode_current_derivatives(v(3), v(2));
         J(3, 2) = dia2_dvgk;
         J(3, 3) = dia2_dvak;
+        J(4, 4) = tube3_.grid_current_dvgk(v(4));
+        const auto [dia3_dvak, dia3_dvgk] = tube3_.anode_current_derivatives(v(5), v(4));
+        J(5, 4) = dia3_dvgk;
+        J(5, 5) = dia3_dvak;
         return J;
     }
 
     // Solves v = p + K i(v). K is a parameter so that the same routine serves
     // both the per-sample solve (K_) and the DC operating-point solve (K_dc_).
-    std::pair<Vec4d, bool> newton_solve(const Mat4d& K, const Vec4d& p,
-                                        const Vec4d& v_guess, int max_iterations) const {
-        Vec4d v = v_guess;
+    std::pair<Vec6d, bool> newton_solve(const Mat6d& K, const Vec6d& p,
+                                        const Vec6d& v_guess, int max_iterations) const {
+        Vec6d v = v_guess;
         double damping = 1.0;
 
         for (int iter = 0; iter < max_iterations; ++iter) {
-            const Vec4d i_tube = compute_tube_currents(v);
-            const Vec4d residual = p - v + K * i_tube;
-            
+            const Vec6d i_tube = compute_tube_currents(v);
+            const Vec6d residual = p - v + K * i_tube;
+
             // Check convergence
             if (residual.lpNorm<1>() < cfg_.newton_tolerance) {
                 return {v, true};
             }
 
             // Compute step
-            const Mat4d Jg = K * compute_jacobian(v) - Mat4d::Identity();
-            Vec4d delta;
-            
+            const Mat6d Jg = K * compute_jacobian(v) - Mat6d::Identity();
+            Vec6d delta;
+
             // Try LU decomposition first
-            Eigen::FullPivLU<Mat4d> lu(Jg);
+            Eigen::FullPivLU<Mat6d> lu(Jg);
             if (lu.isInvertible()) {
                 delta = lu.solve(residual);
             } else {
@@ -533,14 +672,16 @@ private:
         }
     }
 
-    std::vector<double> extract_output(const Eigen::Matrix<double, 4, Eigen::Dynamic>& i_tube,
+    std::vector<double> extract_output(const Eigen::Matrix<double, 6, Eigen::Dynamic>& i_tube,
+                                       const Eigen::Matrix<double, 4, Eigen::Dynamic>& x_state,
                                        size_t n_internal) {
-        // Output is the voltage the second stage's total cathode current
-        // develops across rk2. Both currents must be summed before scaling by
-        // the resistance: scaling only one of them adds a voltage to a current.
+        // Output is the load-side voltage of the output coupling cap:
+        // v_load = gamma * (B+ - x4) - rp3 * ia3, which is zero at DC (the
+        // cap blocks) and needs no manual sign convention.
         std::vector<double> y_int(n_internal);
         for (size_t i = 0; i < n_internal; ++i) {
-            y_int[i] = -(i_tube(3, i) + i_tube(2, i)) * cfg_.rk2; // Inverted
+            y_int[i] = out_gamma_ * (cfg_.bias_voltage - x_state(3, i)) -
+                       out_rp3_ * i_tube(5, i);
         }
 
         std::vector<double> y = (cfg_.oversample_factor > 1)
@@ -568,16 +709,17 @@ private:
         return 2 * half / static_cast<size_t>(cfg_.oversample_factor) + 1;
     }
 
-    // Slowest time constant of the linear subsystem (here the cathode bypass
-    // network), read off the state matrix rather than hardcoded.
+    // Slowest time constant of the linear subsystem, read off the (diagonal)
+    // state matrix rather than hardcoded.
     double state_time_constant() const {
-        return 1.0 / std::abs(A_(0, 0));
+        return 1.0 / A_.diagonal().cwiseAbs().minCoeff();
     }
 
     // The DC initialization removes the cold-start transient, but applying a
     // signal still shifts the average cathode current, so the bypass cap needs
     // several time constants to reach its new steady state.
     size_t calculate_transient_samples(size_t total_samples) const {
+        if (!cfg_.trim_transient) return 0;
         const size_t settling_based = static_cast<size_t>(
             Constants::TRANSIENT_TIME_CONSTANTS * state_time_constant() * cfg_.sample_rate
         );
@@ -599,25 +741,30 @@ private:
     const TubeAmpConfig cfg_;
     const TubeModel tube1_;
     const TubeModel tube2_;
+    const TubeModel tube3_;
     const double dt_;
     const double a_;
     size_t convergence_warning_count_;
     size_t output_offset_;
     std::vector<double> kernel_;  // shared interpolation/anti-alias filter
+    std::mt19937 rng_;
+    double noise_sigma_ = 0.0;    // per-internal-sample input-referred noise
     
     // State-space matrices
-    Mat1d A_, a_eye_, H_;
-    Eigen::Matrix<double, 1, 2> B_;
-    Eigen::Matrix<double, 1, 4> C_;
-    Eigen::Matrix<double, 4, 1> D_, DH_;
-    Eigen::Matrix<double, 4, 2> E_;
-    Mat4d F_, K_;
+    StateMat A_, a_eye_, H_;
+    Eigen::Matrix<double, 4, 2> B_;
+    Eigen::Matrix<double, 4, 6> C_;
+    Eigen::Matrix<double, 6, 4> D_, DH_;
+    Eigen::Matrix<double, 6, 2> E_;
+    Mat6d F_, K_;
+    // Output-network coefficients (see extract_output)
+    double out_gamma_, out_rp3_;
 
     // DC operating point (quiescent state the simulation starts from)
-    Mat1d A_inv_;
-    Mat4d K_dc_;
-    Vec4d v_dc_, i_dc_;
-    Vec1d x_dc_;
+    StateMat A_inv_;
+    Mat6d K_dc_;
+    Vec6d v_dc_, i_dc_;
+    StateVec x_dc_;
 };
 
 // =============================================================================
@@ -628,9 +775,30 @@ std::vector<double> generate_test_signal(double freq, double amp, double dur, do
     const size_t n_samples = static_cast<size_t>(sr * dur);
     std::vector<double> signal(n_samples);
     const double phase_step = 2.0 * M_PI * freq / sr;
-    
+
     for (size_t i = 0; i < n_samples; ++i) {
         signal[i] = amp * std::sin(static_cast<double>(i) * phase_step);
+    }
+    return signal;
+}
+
+// Plucked-note stimulus: the tone under a fast half-cosine attack and an
+// exponential decay. A steady sine hides the channel's dynamic behavior; a
+// pluck exposes the blocking bias shift choking the attack and the note
+// cleaning up as it decays back through the clipping threshold.
+std::vector<double> generate_pluck_signal(double freq, double amp, double dur, double sr,
+                                          double attack_s = 0.002,
+                                          double decay_tau_s = 0.35) {
+    const size_t n_samples = static_cast<size_t>(sr * dur);
+    std::vector<double> signal(n_samples);
+    const double phase_step = 2.0 * M_PI * freq / sr;
+
+    for (size_t i = 0; i < n_samples; ++i) {
+        const double t = static_cast<double>(i) / sr;
+        const double envelope = (t < attack_s)
+            ? 0.5 * (1.0 - std::cos(M_PI * t / attack_s))
+            : std::exp(-(t - attack_s) / decay_tau_s);
+        signal[i] = amp * envelope * std::sin(static_cast<double>(i) * phase_step);
     }
     return signal;
 }
@@ -669,14 +837,37 @@ void save_results_to_csv(const std::vector<double>& x_in,
 //                                MAIN
 // =============================================================================
 
-int main() {
+int main(int argc, char* argv[]) {
     try {
         std::cout << "Starting Improved C++ Tube Amplifier Simulation...\n";
-        
+
         // Configure amplifier
         TubeAmpConfig cfg;
         cfg.gain = 2.0;  // enough input drive to push both stages into clipping
         cfg.bias_voltage = 300.0;
+
+        // Command line: --signal sine|pluck selects the stimulus,
+        // --no-noise disables input-referred noise (used by validate_spice.py
+        // so the ngspice comparison stays exact).
+        bool use_pluck = false;
+        for (int a = 1; a < argc; ++a) {
+            const std::string arg = argv[a];
+            if (arg == "--no-noise") {
+                cfg.noise_enabled = false;
+            } else if (arg == "--signal" && a + 1 < argc) {
+                const std::string value = argv[++a];
+                if (value == "pluck") {
+                    use_pluck = true;
+                } else if (value != "sine") {
+                    std::cerr << "Unknown signal type: " << value << "\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Usage: " << argv[0]
+                          << " [--signal sine|pluck] [--no-noise]\n";
+                return 1;
+            }
+        }
         
         // Use preset
         auto preset_it = TUBE_PRESETS.find("12AT7");
@@ -686,10 +877,21 @@ int main() {
             throw std::runtime_error("Unknown tube preset");
         }
         
-        // Generate test signal. The duration must comfortably exceed the
-        // cathode-bypass settling time (~0.1 s) so that enough steady-state
-        // output survives the transient trim.
-        const auto x_in = generate_test_signal(440.0, 1.5, 0.5, cfg.sample_rate);
+        // Test signal at a realistic guitar level (~75 mV peak, a typical
+        // single-coil), driving the channel into substantial but musical
+        // clipping. Steady sine: duration must comfortably exceed the slowest
+        // settling time (~0.12 s) so steady-state output survives the
+        // transient trim. Pluck: the attack is the point, so the trim is
+        // disabled and the decay is given room to breathe.
+        std::vector<double> x_in;
+        if (use_pluck) {
+            cfg.trim_transient = false;
+            x_in = generate_pluck_signal(440.0, 0.075, 2.0, cfg.sample_rate);
+            std::cout << "Stimulus: 440 Hz pluck (2 s decay)\n";
+        } else {
+            x_in = generate_test_signal(440.0, 0.075, 0.5, cfg.sample_rate);
+            std::cout << "Stimulus: 440 Hz steady sine\n";
+        }
         
         // Process
         TubeAmplifier amp(cfg);

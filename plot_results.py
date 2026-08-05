@@ -58,9 +58,8 @@ CYCLES_TO_SHOW = 2
 N_HARMONICS = 10
 HARMONIC_FLOOR_DB = -80.0  # ignore harmonic peaks below this relative level
 GAIN_CURVE_BINS = 120
-# Inputs this close to zero count as "near quiescent" for the operating-point
-# and small-signal-gain estimates, as a fraction of the input peak.
-QUIESCENT_INPUT_FRACTION = 0.02
+# Inputs within this fraction of the input peak count as "low drive" for the
+# linear-fit gain estimate.
 SMALL_SIGNAL_INPUT_FRACTION = 0.10
 
 
@@ -134,28 +133,32 @@ def even_odd_split(harmonics):
 
 
 def analyze_operating_point(x_in, y_out):
-    """Quiescent level, clip extremes, and small-signal gain, estimated from
-    the recorded waveforms alone (no access to the internals of the sim).
+    """Steady-state level, clip extremes, and a linear-fit gain, estimated
+    from the recorded waveforms alone (no access to the internals of the sim).
 
-    The quiescent output is read off samples where the input is ~zero; with
-    the cathode cap effectively a short at audio rates the transfer curve is
-    single-valued, so both zero-crossing directions agree.
+    The mean output is the honest rest-level metric whether the output is a
+    biased node voltage or AC-coupled; a "value at zero input" reading breaks
+    down once coupling caps give the transfer curve hysteresis. The gain is a
+    least-squares line through the low-drive samples — a true small-signal
+    gain for a gently driven amp, an average transition slope for a heavily
+    driven one.
     """
     peak_in = np.max(np.abs(x_in))
-    near_zero = np.abs(x_in) < QUIESCENT_INPUT_FRACTION * peak_in
-    quiescent = float(np.mean(y_out[near_zero])) if near_zero.any() else float(np.mean(y_out))
+    mean_level = float(np.mean(y_out))
 
     small = np.abs(x_in) < SMALL_SIGNAL_INPUT_FRACTION * peak_in
     if np.count_nonzero(small) >= 2:
-        gain = float(np.polyfit(x_in[small], y_out[small], 1)[0])
+        slope, intercept = np.polyfit(x_in[small], y_out[small], 1)
+        gain, intercept = float(slope), float(intercept)
     else:
-        gain = None
+        gain, intercept = None, mean_level
 
     return {
-        "quiescent": quiescent,
+        "mean_level": mean_level,
         "out_min": float(np.min(y_out)),
         "out_max": float(np.max(y_out)),
         "gain": gain,
+        "intercept": intercept,
         "peak_in": float(peak_in),
     }
 
@@ -219,7 +222,7 @@ def plot_input_waveform(ax, t_ms, x_in, theme):
 def plot_output_waveform(ax, t_ms, y_out, op, theme):
     ax.plot(t_ms, y_out, color=theme["series_output"], linewidth=1.8, solid_joinstyle="round")
     annotate_level(ax, op["out_max"], f"clip {op['out_max']:.0f} V", theme, va="bottom")
-    annotate_level(ax, op["quiescent"], f"quiescent {op['quiescent']:.0f} V", theme, va="bottom")
+    annotate_level(ax, op["mean_level"], f"mean {op['mean_level']:.0f} V", theme, va="bottom")
     annotate_level(ax, op["out_min"], f"clip {op['out_min']:.0f} V", theme, va="top")
     ax.set_xlabel("Time (ms)")
     ax.set_ylabel("Output (V)")
@@ -228,28 +231,28 @@ def plot_output_waveform(ax, t_ms, y_out, op, theme):
 
 
 def plot_transfer_curve(ax, x_in, y_out, op, theme):
-    # Small-signal tangent first, so the curve's departure from it reads as
-    # compression at a glance.
+    # Linear-fit reference line first, so the curve's departure from it (and
+    # any hysteresis loop from coupling-cap memory) reads at a glance.
     if op["gain"] is not None:
         xs = np.array([x_in.min(), x_in.max()])
         ax.plot(
-            xs, op["quiescent"] + op["gain"] * xs,
+            xs, op["intercept"] + op["gain"] * xs,
             color=theme["ink_muted"], linewidth=1.0, linestyle=(0, (4, 3)),
-            label=f"small-signal ({op['gain']:.0f} V/V)",
+            label=f"linear fit ({op['gain']:.0f} V/V)",
         )
     ax.plot(
         x_in, y_out, color=theme["series_transfer"], linewidth=1.4, alpha=0.85,
         label="measured",
     )
     ax.plot(
-        [0], [op["quiescent"]], marker="o", markersize=6,
+        [0], [op["intercept"]], marker="o", markersize=6,
         markerfacecolor=theme["surface"], markeredgecolor=theme["series_transfer"],
         markeredgewidth=1.6, linestyle="none",
     )
     ax.set_xlabel("Input (V)")
     ax.set_ylabel("Output (V)")
     ax.set_title(
-        "Transfer Curve vs Small-Signal Tangent",
+        "Transfer Curve vs Linear Fit",
         color=theme["ink_primary"], fontsize=11, loc="left",
     )
     leg = ax.legend(
@@ -264,7 +267,7 @@ def plot_incremental_gain(ax, x_in, y_out, op, theme):
     x_mid, gain = incremental_gain_curve(x_in, y_out)
     ax.plot(x_mid, gain, color=theme["series_transfer"], linewidth=1.8)
     if op["gain"] is not None:
-        annotate_level(ax, op["gain"], f"small-signal {op['gain']:.0f} V/V", theme)
+        annotate_level(ax, op["gain"], f"linear fit {op['gain']:.0f} V/V", theme)
     ax.axhline(0, color=theme["reference"], linewidth=0.8, zorder=0)
     ax.set_xlabel("Input (V)")
     ax.set_ylabel("dVout / dVin (V/V)")
@@ -379,7 +382,7 @@ def plot_harmonic_bars(ax, harmonics, theme):
 #                          FIGURE & SUMMARY
 # -----------------------------------------------------------------------------
 
-def build_figure(df, sample_rate, theme_name, fmax):
+def build_figure(df, sample_rate, theme_name, fmax, window="cycles"):
     theme = THEMES[theme_name]
 
     x_in = df["input"].to_numpy()
@@ -390,9 +393,12 @@ def build_figure(df, sample_rate, theme_name, fmax):
     harmonics = find_harmonics(freqs, psd, fundamental_freq, fundamental_power, N_HARMONICS)
     op = analyze_operating_point(x_in, y_out)
 
-    window_duration = CYCLES_TO_SHOW / fundamental_freq
     t0 = df["time"].iloc[0]
-    df_wave = df[df["time"] < t0 + window_duration]
+    if window == "full":
+        df_wave = df
+    else:
+        window_duration = CYCLES_TO_SHOW / fundamental_freq
+        df_wave = df[df["time"] < t0 + window_duration]
     t_ms = (df_wave["time"] - t0) * 1000.0
 
     fig, axes = plt.subplots(3, 2, figsize=(12, 12.5))
@@ -425,11 +431,11 @@ def print_summary(sample_rate, analysis):
     print(f"Detected sample rate:  {sample_rate:.2f} Hz")
     print(f"Fundamental:           {analysis['fundamental_freq']:.1f} Hz")
     print(f"Input peak:            {op['peak_in']:.2f} V")
-    print(f"Quiescent output:      {op['quiescent']:.1f} V")
+    print(f"Mean output level:     {op['mean_level']:.1f} V")
     print(f"Output clip levels:    {op['out_min']:.1f} V .. {op['out_max']:.1f} V "
           f"({op['out_max'] - op['out_min']:.1f} Vpp)")
     if op["gain"] is not None:
-        print(f"Small-signal gain:     {op['gain']:.1f} V/V")
+        print(f"Linear-fit gain:       {op['gain']:.1f} V/V")
     if analysis["thd"] is not None:
         print(f"THD (through H{analysis['harmonics'][-1][0]}):     {analysis['thd']:.1f} %")
     for name, level in analysis["even_odd"].items():
@@ -449,12 +455,15 @@ def main():
     parser.add_argument("--theme", choices=THEMES.keys(), default="light")
     parser.add_argument("--fmax", type=float, default=5000.0,
                         help="Spectrum frequency-axis limit in Hz")
+    parser.add_argument("--window", choices=("cycles", "full"), default="cycles",
+                        help="Waveform panels: a couple of cycles (steady tones) "
+                             "or the full recording (plucks/bursts)")
     parser.add_argument("--no-show", action="store_true", help="Skip the interactive window")
     args = parser.parse_args()
 
     df, sample_rate = load_results(args.csv)
 
-    fig, analysis = build_figure(df, sample_rate, args.theme, args.fmax)
+    fig, analysis = build_figure(df, sample_rate, args.theme, args.fmax, args.window)
     print_summary(sample_rate, analysis)
 
     fig.savefig(args.out, dpi=200, facecolor=fig.get_facecolor())

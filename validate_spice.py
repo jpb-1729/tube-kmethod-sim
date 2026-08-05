@@ -36,9 +36,18 @@ RG = 68e3
 RK1 = 0.820e3
 RK2 = 50e3
 CK = 25e-6
+C_COUPLE = 22e-9
+R_TOP = 680e3
+R_SHUNT = 330e3
+RG3 = 470e3
+RK3 = 0.820e3
+CK3 = 25e-6
+RA3 = 100e3
+C_OUT = 22e-9
+R_LOAD = 1e6
 BIAS_V = 300.0
 GAIN = 2.0
-INPUT_AMP = 1.5       # generate_test_signal amplitude (pre-gain)
+INPUT_AMP = 0.075     # generate_test_signal amplitude (pre-gain)
 FREQ = 440.0
 SAMPLE_RATE = 44100.0
 EXP_CLAMP = 50.0
@@ -46,6 +55,7 @@ EXP_CLAMP = 50.0
 # (mu, ex, kg, kp, kvb) — Koren fits, same as TUBE_PRESETS in main.cpp.
 TUBE1 = dict(mu=60.0, ex=1.35, kg=460.0, kp=300.0, kvb=300.0)   # 12AT7
 TUBE2 = dict(mu=100.0, ex=1.4, kg=1060.0, kp=600.0, kvb=300.0)  # 12AX7
+TUBE3 = TUBE2                                                    # 12AX7
 GRID = dict(vct=0.5, gg=2e-3, cg=10.0, eps=1.3, igo=8e-8)
 
 # Analysis window: 44 cycles of 440 Hz is exactly 0.1 s = 4410 samples at
@@ -56,7 +66,11 @@ N_HARMONICS = 10
 # --- Tolerances ---
 TOL_OP_VOLTS = 0.05          # abs disagreement per DC node voltage (V)
 TOL_TRANSFER_MEAN = 1.0      # mean abs transfer-curve deviation (V)
-TOL_TRANSFER_MAX = 3.0       # max abs transfer-curve deviation (V)
+# The C++ output is band-limited by the decimation filter while the ngspice
+# transient is full-bandwidth, so bins on the near-vertical clipping
+# transitions legitimately differ by a few volts out of a ~300 Vpp swing;
+# in-band equivalence is checked rigorously by the harmonic comparison.
+TOL_TRANSFER_MAX = 6.0       # max abs transfer-curve deviation (V)
 TOL_HARMONIC_DB = 1.5        # per-harmonic dBc deviation (harmonics > -60 dBc)
 TOL_THD_REL = 0.10           # relative THD disagreement
 HARMONIC_COMPARE_FLOOR_DB = -60.0
@@ -83,7 +97,7 @@ def grid_expr(grid, cathode):
 def build_netlist(workdir, t_stop, t_max_step):
     tran_file = workdir / "spice_tran.txt"
     op_file = workdir / "spice_op.txt"
-    netlist = f"""* Two-stage triode preamp - behavioral Koren models (mirror of main.cpp)
+    netlist = f"""* Three-stage triode preamp - behavioral Koren models (mirror of main.cpp)
 VIN in 0 DC 0 SIN(0 {INPUT_AMP * GAIN} {FREQ})
 VDD vdd 0 DC {BIAS_V}
 RG in g1 {RG}
@@ -97,15 +111,29 @@ BIP1 p1 k1 I={anode_expr('p1', 'g1', 'k1', TUBE1)}
 RK2 k2 0 {RK2}
 BIG2 p1 k2 I={grid_expr('p1', 'k2')}
 BIP2 vdd k2 I={anode_expr('vdd', 'p1', 'k2', TUBE2)}
+* Interstage: coupling cap into divider (tone-stack loss) and grid stopper
+CC k2 m {C_COUPLE}
+RTOP m a {R_TOP}
+RSHUNT a 0 {R_SHUNT}
+RG3 a g3 {RG3}
+* Stage 3 (12AX7) second gain stage
+RK3 k3 0 {RK3}
+CK3 k3 0 {CK3}
+RA3 vdd p3 {RA3}
+BIG3 g3 k3 I={grid_expr('g3', 'k3')}
+BIP3 p3 k3 I={anode_expr('p3', 'g3', 'k3', TUBE3)}
+* AC-coupled output into the next stage's input impedance
+CO p3 outn {C_OUT}
+RL outn 0 {R_LOAD}
 
 .options reltol=1e-5 abstol=1e-12 vntol=1e-9
 .control
 set filetype=ascii
 op
 echo OP-RESULTS > {op_file}
-print v(g1)-v(k1) v(p1)-v(k1) v(p1)-v(k2) v(vdd)-v(k2) >> {op_file}
+print v(g1)-v(k1) v(p1)-v(k1) v(p1)-v(k2) v(vdd)-v(k2) v(g3)-v(k3) v(p3)-v(k3) >> {op_file}
 tran {t_max_step} {t_stop} 0 {t_max_step}
-wrdata {tran_file} v(k2) v(in)
+wrdata {tran_file} v(outn) v(in)
 quit
 .endc
 .end
@@ -116,12 +144,15 @@ quit
 
 
 def run_cpp(binary, workdir):
+    # --no-noise: the ngspice netlist is noiseless, so the comparison must be
+    # run against the deterministic signal path.
     result = subprocess.run(
-        [str(Path(binary).resolve())], cwd=workdir,
+        [str(Path(binary).resolve()), "--no-noise"], cwd=workdir,
         capture_output=True, text=True, check=True,
     )
     match = re.search(
-        r"DC-OP vgk1=(\S+) vak1=(\S+) vgk2=(\S+) vak2=(\S+)", result.stdout
+        r"DC-OP vgk1=(\S+) vak1=(\S+) vgk2=(\S+) vak2=(\S+) vgk3=(\S+) vak3=(\S+)",
+        result.stdout,
     )
     if not match:
         raise SystemExit("Error: no DC-OP line in simulator output; rebuild the binary.")
@@ -144,9 +175,9 @@ def run_ngspice(workdir, netlist):
 def parse_op(op_file):
     """The .control print writes lines like 'v(g1)-v(k1) = -1.234e+00'."""
     values = re.findall(r"=\s*(-?[\d.eE+-]+)", op_file.read_text())
-    if len(values) < 4:
-        raise SystemExit(f"Error: could not parse 4 op voltages from {op_file}")
-    return np.array([float(v) for v in values[:4]])
+    if len(values) < 6:
+        raise SystemExit(f"Error: could not parse 6 op voltages from {op_file}")
+    return np.array([float(v) for v in values[:6]])
 
 
 def parse_tran(tran_file):
@@ -156,13 +187,13 @@ def parse_tran(tran_file):
     return data[:, 0], data[:, 1], data[:, 3]
 
 
-def steady_state_window(t, vk2, vin):
+def steady_state_window(t, vout, vin):
     """Interpolate the (variable-step) SPICE transient onto the simulator's
     uniform sample grid over the final N_CYCLES cycles."""
     duration = N_CYCLES / FREQ
     n = int(round(duration * SAMPLE_RATE))
     grid = t[-1] - duration + np.arange(n) / SAMPLE_RATE
-    out = -np.interp(grid, t, vk2)     # C++ output convention: -(cathode V)
+    out = np.interp(grid, t, vout)     # load-side output, same sign as C++
     drive = np.interp(grid, t, vin)
     return drive, out
 
@@ -238,7 +269,8 @@ def main():
     # --- 1. DC operating point ---
     dc_spice = parse_op(op_file)
     print("\nDC operating point (C++ vs ngspice):")
-    for name, c, s in zip(("vgk1", "vak1", "vgk2", "vak2"), dc_cpp, dc_spice):
+    for name, c, s in zip(("vgk1", "vak1", "vgk2", "vak2", "vgk3", "vak3"),
+                          dc_cpp, dc_spice):
         print(f"    {name}: {c:+.4f} V vs {s:+.4f} V")
         report.check(f"{name} |diff|", abs(c - s), TOL_OP_VOLTS, "{:.4f} V")
 

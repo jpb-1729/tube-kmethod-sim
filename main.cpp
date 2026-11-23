@@ -370,14 +370,7 @@ public:
             : x_in;
         const size_t N = x_int.size();
 
-        // Pre-allocate all working memory
         Eigen::Matrix<double, 2, Eigen::Dynamic> u(2, N);
-        Eigen::Matrix<double, 4, Eigen::Dynamic> x_state(4, N);
-        Eigen::Matrix<double, 6, Eigen::Dynamic> i_tube(6, N);
-        Eigen::Matrix<double, 6, Eigen::Dynamic> v_nodes(6, N);
-
-        // Start from the quiescent operating point, so sample 0 is already a
-        // self-consistent solution rather than an unsolved guess.
         prepare_input(x_int, u);
         if (noise_sigma_ > 0.0) {
             std::normal_distribution<double> dist(0.0, noise_sigma_);
@@ -385,16 +378,7 @@ public:
                 u(0, i) += dist(rng_);
             }
         }
-        x_state.setZero();
-        v_nodes.col(0) = v_dc_;
-        x_state.col(0) = x_dc_;
-        i_tube.col(0) = i_dc_;
-
-        // Main processing loop
-        process_samples(u, x_state, i_tube, v_nodes, N);
-
-        // Extract and prepare output
-        return extract_output(i_tube, x_state, N);
+        return prepare_output(process_samples(u));
     }
 
     // Index into the ORIGINAL input where the returned output starts (the
@@ -554,44 +538,33 @@ private:
         return guess;
     }
 
-    void process_samples(const Eigen::Matrix<double, 2, Eigen::Dynamic>& u,
-                        Eigen::Matrix<double, 4, Eigen::Dynamic>& x_state,
-                        Eigen::Matrix<double, 6, Eigen::Dynamic>& i_tube,
-                        Eigen::Matrix<double, 6, Eigen::Dynamic>& v_nodes,
-                        size_t N) {
-        for (size_t n = 1; n < N; ++n) {
-            process_single_sample(n, u, x_state, i_tube, v_nodes);
+    std::vector<double> process_samples(const Eigen::Matrix<double, 2, Eigen::Dynamic>& u) {
+        // The quiescent solution describes the instant before the first sample.
+        StateVec state = x_dc_;
+        Vec6d currents = i_dc_;
+        Vec6d voltages = v_dc_;
+        Eigen::Vector2d previous_input(0.0, cfg_.bias_voltage);
+        std::vector<double> output(u.cols());
+
+        for (size_t n = 0; n < output.size(); ++n) {
+            const Eigen::Vector2d input = u.col(n);
+            const StateVec state_part = (a_eye_ + A_) * state
+                                      + B_ * (input + previous_input) + C_ * currents;
+            const Vec6d p = DH_ * state_part + E_ * input;
+            const auto [solution, converged] = newton_solve(K_, p, voltages,
+                                                           cfg_.newton_max_iterations);
+            if (!converged) {
+                handle_convergence_failure(n);
+            }
+            voltages = solution;
+            currents = compute_tube_currents(voltages);
+            state = H_ * (state_part + C_ * currents);
+            previous_input = input;
+
+            // Load-side voltage of the output coupling capacitor.
+            output[n] = out_gamma_ * (cfg_.bias_voltage - state(3)) - out_rp3_ * currents(5);
         }
-    }
-
-    void process_single_sample(size_t n,
-                              const Eigen::Matrix<double, 2, Eigen::Dynamic>& u,
-                              Eigen::Matrix<double, 4, Eigen::Dynamic>& x_state,
-                              Eigen::Matrix<double, 6, Eigen::Dynamic>& i_tube,
-                              Eigen::Matrix<double, 6, Eigen::Dynamic>& v_nodes) {
-        const StateVec x_prev = x_state.col(n - 1);
-        const Vec6d i_prev = i_tube.col(n - 1);
-        const Eigen::Vector2d u_curr = u.col(n);
-        const Eigen::Vector2d u_prev = u.col(n - 1);
-
-        // K-method state calculation
-        const StateVec state_part = (a_eye_ + A_) * x_prev + B_ * (u_curr + u_prev) + C_ * i_prev;
-        const Vec6d p = DH_ * state_part + E_ * u_curr;
-        
-        // Solve nonlinear system with previous solution as initial guess
-        auto [v_solved, converged] = newton_solve(K_, p, v_nodes.col(n - 1),
-                                                  cfg_.newton_max_iterations);
-        v_nodes.col(n) = v_solved;
-
-        if (!converged) {
-            handle_convergence_failure(n);
-        }
-
-        // Update currents and state
-        i_tube.col(n) = compute_tube_currents(v_nodes.col(n));
-        const Vec6d i_curr = i_tube.col(n);
-        x_state.col(n) = H_ * ((a_eye_ + A_) * x_prev + B_ * (u_curr + u_prev) + 
-                               C_ * (i_curr + i_prev));
+        return output;
     }
 
     Vec6d compute_tube_currents(const Vec6d& v) const {
@@ -672,18 +645,7 @@ private:
         }
     }
 
-    std::vector<double> extract_output(const Eigen::Matrix<double, 6, Eigen::Dynamic>& i_tube,
-                                       const Eigen::Matrix<double, 4, Eigen::Dynamic>& x_state,
-                                       size_t n_internal) {
-        // Output is the load-side voltage of the output coupling cap:
-        // v_load = gamma * (B+ - x4) - rp3 * ia3, which is zero at DC (the
-        // cap blocks) and needs no manual sign convention.
-        std::vector<double> y_int(n_internal);
-        for (size_t i = 0; i < n_internal; ++i) {
-            y_int[i] = out_gamma_ * (cfg_.bias_voltage - x_state(3, i)) -
-                       out_rp3_ * i_tube(5, i);
-        }
-
+    std::vector<double> prepare_output(std::vector<double> y_int) {
         std::vector<double> y = (cfg_.oversample_factor > 1)
             ? resample::decimate_fir(y_int, cfg_.oversample_factor, kernel_)
             : std::move(y_int);
@@ -757,7 +719,7 @@ private:
     Eigen::Matrix<double, 6, 4> D_, DH_;
     Eigen::Matrix<double, 6, 2> E_;
     Mat6d F_, K_;
-    // Output-network coefficients (see extract_output)
+    // Output-network coefficients for the load-side voltage
     double out_gamma_, out_rp3_;
 
     // DC operating point (quiescent state the simulation starts from)

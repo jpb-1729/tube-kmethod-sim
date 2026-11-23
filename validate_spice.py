@@ -11,7 +11,7 @@
 #   1. DC operating point: the C++ steady-state Newton solve (printed by the
 #      simulator as a "DC-OP" line) vs ngspice .op node voltages.
 #   2. Steady-state transfer curve: binned (grid drive, output) pairs from the
-#      last cycles of both transients.
+#      last cycles of both transients, compared separately on each branch.
 #   3. Harmonic levels and THD: coherent FFT over an integer number of
 #      fundamental cycles on both outputs.
 #
@@ -225,6 +225,16 @@ def binned_transfer(drive, out, edges):
     return means
 
 
+def transfer_branches(drive, out, edges):
+    # The window contains whole cycles, so the centered difference wraps at
+    # its ends. A sample exactly at a turning point belongs to neither branch.
+    delta = np.roll(drive, -1) - np.roll(drive, 1)
+    return {
+        name: binned_transfer(drive[mask], out[mask], edges)
+        for name, mask in (("rising", delta > 0), ("falling", delta < 0))
+    }
+
+
 class Report:
     def __init__(self):
         self.failures = 0
@@ -280,13 +290,13 @@ def main():
     drive_s, out_s = steady_state_window(t, vk2, vin)
 
     edges = np.linspace(-INPUT_AMP * GAIN, INPUT_AMP * GAIN, 81)
-    curve_c = binned_transfer(drive_c, out_c, edges)
-    curve_s = binned_transfer(drive_s, out_s, edges)
-    both = ~np.isnan(curve_c) & ~np.isnan(curve_s)
-    deviation = np.abs(curve_c[both] - curve_s[both])
+    branches_c = transfer_branches(drive_c, out_c, edges)
+    branches_s = transfer_branches(drive_s, out_s, edges)
     print("\nSteady-state transfer curve (80 bins over the drive range):")
-    report.check("mean |deviation|", float(np.mean(deviation)), TOL_TRANSFER_MEAN, "{:.3f} V")
-    report.check("max |deviation|", float(np.max(deviation)), TOL_TRANSFER_MAX, "{:.3f} V")
+    for name, curve in branches_c.items():
+        deviation = np.abs(curve - branches_s[name])
+        report.check(f"{name} mean |deviation|", np.mean(deviation), TOL_TRANSFER_MEAN, "{:.3f} V")
+        report.check(f"{name} max |deviation|", np.max(deviation), TOL_TRANSFER_MAX, "{:.3f} V")
 
     # --- 3. Harmonics and THD ---
     harm_c, thd_c = harmonic_levels(out_c)
